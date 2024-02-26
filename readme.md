@@ -6,3 +6,5 @@ Approaches:
 
 1. Naive approach: took 2m27s
    ![Naive Approach Results](./results/naive.png)
+
+2. Better approach
