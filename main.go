@@ -1,26 +1,39 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"runtime/trace"
-	"sort"
-	"strconv"
-	"strings"
+	"slices"
 	"sync"
+	"time"
+	"unsafe"
+
+	"github.com/dolthub/swiss"
 )
 
-type Output struct {
-	Name string
-	Min  float64
-	Avg  float64
-	Max  float64
+var (
+	// others: "heap", "threadcreate", "block", "mutex"
+	profileTypes = []string{"goroutine", "allocs"}
+
+	shouldProfile = flag.Bool("p", false, "if true, enables profiling")
+)
+
+const maxNames = 10000
+const maxNameLen = 100
+const maxLineLenBytes = 128
+const maxChunkSize = 64 * 1024 * 1024 // 64MB
+
+type Stats struct {
+	Min   float64
+	Sum   float64
+	Max   float64
+	Count int
 }
 
 type Line struct {
@@ -29,240 +42,247 @@ type Line struct {
 }
 
 type BRC struct {
-	input           string
-	max_go_routines int
-	output          []Output
+	inputFile       string
+	numParsers      int
+	output          *swiss.Map[string, *Stats]
 	wg              *sync.WaitGroup
-	linesChan       chan []Line
-	// stores name: min, max, sum, count
-	aggregateChan chan map[string][4]float64
+	offsetChan      chan int64
+	mergeOutputChan chan *swiss.Map[string, *Stats]
 }
 
-func newBRC(input string, max_go_routines int) *BRC {
+func newBRC(inputFile string, numParsers int) *BRC {
 	return &BRC{
-		input:           input,
-		max_go_routines: max_go_routines,
-		aggregateChan:   make(chan map[string][4]float64, max_go_routines),
-		output:          make([]Output, 0),
-		linesChan:       make(chan []Line, max_go_routines),
+		inputFile:       inputFile,
+		numParsers:      numParsers,
+		output:          swiss.NewMap[string, *Stats](maxNames),
 		wg:              &sync.WaitGroup{},
+		mergeOutputChan: make(chan *swiss.Map[string, *Stats], numParsers),
+		offsetChan:      make(chan int64, numParsers),
 	}
 }
-
-var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
-var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
-var executionprofile = flag.String("execprofile", "", "write tarce execution to `file`")
-var input = flag.String("input", "", "path to the input file to evaluate")
 
 func init() {
 	flag.Parse()
 }
 
 func main() {
-	if *input == "" {
-		log.Fatalln("Input file is required")
-	}
+	if *shouldProfile {
+		nowUnix := time.Now().Unix()
+		os.MkdirAll(fmt.Sprintf("profiles/%d", nowUnix), 0755)
+		for _, profileType := range profileTypes {
+			file, _ := os.Create(fmt.Sprintf("profiles/%d/%s.pprof",
+				nowUnix, profileType))
+			defer file.Close()
+			defer pprof.Lookup(profileType).WriteTo(file, 0)
+		}
 
-	if *executionprofile != "" {
-		f, err := os.Create("./profiles/" + *executionprofile)
-		if err != nil {
-			log.Fatal("could not create trace execution profile: ", err)
-		}
-		defer f.Close()
-		if err := trace.Start(f); err != nil {
-			panic(err)
-		}
-		defer trace.Stop()
-	}
-
-	if *cpuprofile != "" {
-		f, err := os.Create("./profiles/" + *cpuprofile)
-		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
-		}
+		file, _ := os.Create(fmt.Sprintf("profiles/%d/cpu.pprof",
+			nowUnix))
+		defer file.Close()
+		pprof.StartCPUProfile(file)
 		defer pprof.StopCPUProfile()
 	}
 
-	max_go_routines := 10
-	brc := newBRC(*input, max_go_routines)
+	numParsers := runtime.NumCPU()
+	brc := newBRC("./data/measurements.txt", numParsers)
 
-	brc.wg.Add(1)
-	go brc.readAndParseFile()
-
-	brc.wg.Add(1)
-	go brc.processAggregates()
-
-	for i := 0; i < brc.max_go_routines; i++ {
-		brc.wg.Add(1)
-		go brc.processLines()
-	}
-	brc.wg.Wait()
-
-	brc.printOutput()
-
-	if *memprofile != "" {
-		f, err := os.Create("./profiles/" + *memprofile)
-		if err != nil {
-			log.Fatal("could not create memory profile: ", err)
-		}
-		defer f.Close()
-		runtime.GC()
-		if err := pprof.WriteHeapProfile(f); err != nil {
-			log.Fatal("could not write memory profile: ", err)
-		}
-	}
-}
-
-func (b *BRC) readAndParseFile() {
-	defer b.wg.Done()
-
-	f, err := os.Open(b.input)
+	f, err := os.Open(brc.inputFile)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	go func() {
+		stat, err := f.Stat()
+		if err != nil {
+			return
+		}
 
-	lines := []Line{}
+		for i := int64(0); i < stat.Size(); i += maxChunkSize {
+			brc.offsetChan <- i
+		}
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		parsedLine := parseLine(line)
-		lines = append(lines, parsedLine)
+		close(brc.offsetChan)
+	}()
 
-		if len(lines) == 100 {
-			b.linesChan <- lines
-			lines = []Line{}
+	for i := 0; i < brc.numParsers; i++ {
+		brc.wg.Add(1)
+
+		go func() {
+			defer brc.wg.Done()
+			buf := make([]byte, maxChunkSize+maxLineLenBytes)
+
+			for offset := range brc.offsetChan {
+				agg := brc.parseFile(f, buf, offset, maxChunkSize)
+				brc.mergeOutputChan <- agg
+			}
+		}()
+	}
+
+	go func() {
+		brc.wg.Wait()
+		close(brc.mergeOutputChan)
+	}()
+
+	brc.mergeOutputs()
+	brc.printOutput()
+}
+
+func (b *BRC) parseFile(f *os.File, buf []byte, offset int64, chunkSize int) *swiss.Map[string, *Stats] {
+	agg := swiss.NewMap[string, *Stats](maxNames)
+
+	bytesRead, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		log.Fatal(err)
+	}
+
+	isNamePart := true
+	currIdx := 0
+
+	if offset != 0 {
+		// move to the character after the first newline from the offset
+		for currIdx < bytesRead {
+			if buf[currIdx] == '\n' {
+				currIdx++
+				break
+			}
+			currIdx++
 		}
 	}
 
-	if len(lines) > 0 {
-		b.linesChan <- lines
-	}
+	start := currIdx
+	name := make([]byte, maxNameLen)
+	nameLen := 0
 
-	close(b.linesChan)
-}
+	// a line has 2 parts: <name>;<value>
+	for {
+		if isNamePart {
+			// read until semi-colon
+			for currIdx < bytesRead {
+				if buf[currIdx] == ';' {
+					nameLen = copy(name, buf[start:currIdx])
+					currIdx++
+					start = currIdx
+					isNamePart = false
 
-func (b *BRC) processLines() {
-	defer b.wg.Done()
+					break
+				}
 
-	aggregate := make(map[string][4]float64)
+				currIdx++
+			}
+		} else {
+			// read until newline
+			for currIdx < bytesRead {
+				if buf[currIdx] == '\n' {
+					value := parseFloat(buf[start:currIdx])
+					nameUnsafeStr := unsafe.String(&name[0], nameLen)
 
-	for lines := range b.linesChan {
-		for _, line := range lines {
-			if parts, ok := aggregate[line.Name]; ok {
-				min := math.Min(parts[0], line.Temp)
-				max := math.Max(parts[1], line.Temp)
-				sum := parts[2] + line.Temp
-				count := parts[3] + 1
+					if a, exists := agg.Get(nameUnsafeStr); !exists {
+						name := string(name[:nameLen])
+						agg.Put(name, &Stats{
+							Min:   value,
+							Sum:   value,
+							Max:   value,
+							Count: 1,
+						})
+					} else {
+						a.Count++
+						a.Sum += value
+						if value < a.Min {
+							a.Min = value
+						}
+						if value > a.Max {
+							a.Max = value
+						}
+					}
 
-				aggregate[line.Name] = [4]float64{min, max, sum, count}
-			} else {
-				aggregate[line.Name] = [4]float64{line.Temp, line.Temp, line.Temp, 1}
+					currIdx++
+					start = currIdx
+					isNamePart = true
+					break
+				}
+
+				currIdx++
 			}
 		}
+
+		// we want to break out if we encounter a new line after the chunkSize
+		if currIdx >= bytesRead || (isNamePart && currIdx >= chunkSize) {
+			break
+		}
 	}
 
-	b.aggregateChan <- aggregate
+	return agg
 }
 
-func parseLine(line string) Line {
-	parts := strings.Split(line, ";")
-
-	if len(parts) != 2 {
-		panic("Invalid line: " + line)
+func parseFloat(bs []byte) float64 {
+	var intStartIdx int // is negative?
+	if bs[0] == '-' {
+		intStartIdx = 1
 	}
 
-	temp, err := strconv.ParseFloat(parts[1], 64)
-	if err != nil {
-		panic("Invalid temperature: " + parts[1])
+	v := float64(bs[len(bs)-1]-'0') / 10 // single decimal digit
+	place := 1.0
+	for i := len(bs) - 3; i >= intStartIdx; i-- { // integer part
+		v += float64(bs[i]-'0') * place
+		place *= 10
 	}
 
-	return Line{
-		Name: parts[0],
-		Temp: math.Ceil(temp),
+	if intStartIdx == 1 {
+		v *= -1
 	}
+	return v
 }
 
-func (b *BRC) processAggregates() {
-	defer b.wg.Done()
+func (b *BRC) mergeOutputs() {
+	output := swiss.NewMap[string, *Stats](maxNames)
 
-	num_aggs_received := 0
-	// min, max, sum, count
-	combinedAggs := make(map[string][4]float64)
-
-	// combine aggregate maps
-	for agg := range b.aggregateChan {
-		num_aggs_received++
-
-		for name, parts := range agg {
-			entry, ok := combinedAggs[name]
-			if ok {
-				min := math.Min(entry[0], parts[0])
-				max := math.Max(entry[1], parts[1])
-				sum := entry[2] + parts[2]
-				count := entry[3] + parts[3]
-
-				combinedAggs[name] = [4]float64{min, max, sum, count}
+	for agg := range b.mergeOutputChan {
+		agg.Iter(func(name string, value *Stats) bool {
+			if a, exists := output.Get(name); !exists {
+				output.Put(name, value)
 			} else {
-				min := parts[0]
-				max := parts[1]
-				sum := parts[2]
-				count := parts[3]
-
-				combinedAggs[name] = [4]float64{min, max, sum, count}
+				a.Count += value.Count
+				a.Sum += value.Sum
+				if value.Min < a.Min {
+					a.Min = value.Min
+				}
+				if value.Max > a.Max {
+					a.Max = value.Max
+				}
 			}
-		}
-
-		if num_aggs_received == b.max_go_routines {
-			close(b.aggregateChan)
-		}
-	}
-
-	// min, avg, max
-	output := make(map[string][3]float64)
-
-	for name, parts := range combinedAggs {
-		min := parts[0]
-		max := parts[1]
-		sum := parts[2]
-		count := parts[3]
-
-		avg := sum / count
-
-		output[name] = [3]float64{min, avg, max}
-	}
-
-	records := make([]Output, 0, len(output))
-
-	for name, parts := range output {
-		records = append(records, Output{
-			Name: name,
-			Min:  parts[0],
-			Avg:  parts[1],
-			Max:  parts[2],
+			return false
 		})
 	}
 
-	sort.Slice(records, func(i, j int) bool {
-		return records[i].Name < records[j].Name
-	})
-
-	b.output = records
+	b.output = output
 }
 
 func (b *BRC) printOutput() {
-	fmt.Print("{")
-	for i, record := range b.output {
-		fmt.Printf("%s:%.1f/%.1f/%.1f", record.Name, record.Min, record.Avg, record.Max)
-		if i < len(b.output)-1 {
-			fmt.Print(";")
+	names := make([]string, 0, b.output.Capacity())
+
+	b.output.Iter(func(name string, _ *Stats) bool {
+		names = append(names, name)
+		return false
+	})
+
+	slices.Sort(names)
+
+	str := "{"
+	for i, name := range names {
+		val, _ := b.output.Get(name)
+		avg := round(round(val.Sum) / float64(val.Count))
+		str += fmt.Sprintf("%s=%.1f/%.1f/%.1f", name, val.Min, avg, val.Max)
+
+		if i < len(names)-1 {
+			str += ", "
 		}
 	}
-	fmt.Print("}")
+	str += "}"
+
+	fmt.Println(str)
+}
+
+func round(f float64) float64 {
+	return math.Floor((f+0.05)*10) / 10
 }
